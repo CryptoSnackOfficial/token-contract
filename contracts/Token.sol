@@ -27,6 +27,9 @@ contract CryptoSnackToken is ERC20, ERC20Burnable, ERC20Pausable, Ownable, Reent
     error InvalidTaxWallet();
     error TaxTooHigh(uint16 tax);
     error InvalidDexAddress();
+    error InvalidBlacklistAccount();
+    error AccountIsWhitelisted(); // used to prevent blacklisting of whitelisted accounts
+    error AccountIsBlacklisted(); // used to prevent whitelisting of blacklisted accounts
     error TransferFailed();
     error AccountNotFrozen();
     error AccountAlreadyFrozen();
@@ -35,7 +38,6 @@ contract CryptoSnackToken is ERC20, ERC20Burnable, ERC20Pausable, Ownable, Reent
     // Events
     event BurnEnabled();
     event BurnDisabled();
-    event TokensMinted(address indexed to, uint256 value);
     event TaxWalletUpdated(address indexed oldWallet, address indexed newWallet);
     event TaxesEnabled();
     event TaxesDisabled();
@@ -45,6 +47,8 @@ contract CryptoSnackToken is ERC20, ERC20Burnable, ERC20Pausable, Ownable, Reent
     event WhitelistStatusChanged(address indexed account, bool status);
     event AccountFrozen(address indexed account, uint256 until);
     event TokensRecovered(address indexed from, address indexed to, uint256 value);
+    event TokenReclaimed(address indexed token, address indexed to, uint256 value);
+    event BNBReclaimed(address indexed to, uint256 value);
 
     // State variables
     mapping(address => bool)    private _blacklist;
@@ -75,12 +79,6 @@ contract CryptoSnackToken is ERC20, ERC20Burnable, ERC20Pausable, Ownable, Reent
         _buyingTax = buyingTax;
         _taxEnabled = sellingTax > 0 || buyingTax > 0;
         _burnEnabled = false;
-    }
-
-    // Basic operations
-    function mint(address to, uint256 value) external onlyOwner {
-        _mint(to, value);
-        emit TokensMinted(to, value);
     }
 
     // Burn
@@ -138,7 +136,9 @@ contract CryptoSnackToken is ERC20, ERC20Burnable, ERC20Pausable, Ownable, Reent
         uint256 totalValue;
 
         for (uint256 i = 0; i < length;) {
-            totalValue += values[i];
+            if (!_blacklist[recipients[i]]) {
+                totalValue += values[i];
+            }
             unchecked {++i;}
         }
 
@@ -161,7 +161,14 @@ contract CryptoSnackToken is ERC20, ERC20Burnable, ERC20Pausable, Ownable, Reent
         if (length == 0 || length > MAX_BATCH_SIZE) revert InvalidBatchLength();
 
         address sender = _msgSender();
-        uint256 totalValue = value * length;
+        uint256 totalValue;
+
+        for (uint256 i = 0; i < length;) {
+            if (!_blacklist[recipients[i]]) {
+                totalValue += value;
+            }
+            unchecked {++i;}
+        }
         if (balanceOf(sender) < totalValue) revert TransferFailed();
 
         for (uint256 i = 0; i < length;) {
@@ -216,6 +223,8 @@ contract CryptoSnackToken is ERC20, ERC20Burnable, ERC20Pausable, Ownable, Reent
 
     // Whitelist management
     function setWhitelist(address account, bool status) external onlyOwner {
+        if (_blacklist[account]) revert AccountIsBlacklisted();
+        if (_frozenUntil[account] > block.timestamp && status) revert FrozenAccount(account);
         _whitelist[account] = status;
         emit WhitelistStatusChanged(account, status);
     }
@@ -226,6 +235,9 @@ contract CryptoSnackToken is ERC20, ERC20Burnable, ERC20Pausable, Ownable, Reent
 
     // Blacklist management
     function setBlacklist(address account, bool status) external onlyOwner {
+        if (account == address(0)) revert InvalidBlacklistAccount();
+        if (_whitelist[account]) revert AccountIsWhitelisted();
+        if (_frozenUntil[account] > block.timestamp && status) revert FrozenAccount(account);
         _blacklist[account] = status;
         emit BlacklistStatusChanged(account, status);
     }
@@ -286,8 +298,9 @@ contract CryptoSnackToken is ERC20, ERC20Burnable, ERC20Pausable, Ownable, Reent
         uint256 taxAmount = 0;
         if (_isDex[from] && _buyingTax > 0) {
             taxAmount = _calculateTax(value, _buyingTax);
-        } else if (_isDex[to] && _sellingTax > 0) {
-            taxAmount = _calculateTax(value, _sellingTax);
+        }
+        if (_isDex[to] && _sellingTax > 0) {
+            taxAmount += _calculateTax(value, _sellingTax);
         }
 
         if (taxAmount > 0) {
@@ -317,11 +330,13 @@ contract CryptoSnackToken is ERC20, ERC20Burnable, ERC20Pausable, Ownable, Reent
     function reclaimToken(IERC20 token) external onlyOwner {
         uint256 balance = token.balanceOf(address(this));
         token.safeTransfer(owner(), balance);
+        emit TokenReclaimed(address(token), owner(), balance);
     }
 
     function reclaimBNB() external onlyOwner {
         (bool success,) = owner().call{value: address(this).balance}("");
         if (!success) revert TransferFailed();
+        emit BNBReclaimed(owner(), address(this).balance);
     }
 
     /**

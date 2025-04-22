@@ -22,7 +22,8 @@ contract CryptoSnackVesting is Ownable, ReentrancyGuard {
     }
 
     // Constants
-    uint32 private constant MAX_VESTING_TIME = 315360000; // 10 years (10 * 365 * 24 * 60 * 60)
+    uint32 private constant MAX_START_OFFSET_TIME = 365 days;
+    uint32 private constant MAX_VESTING_TIME = 10 * 365 days;
 
     // Errors
     error InvalidBeneficiary();
@@ -46,6 +47,8 @@ contract CryptoSnackVesting is Ownable, ReentrancyGuard {
     event TokensReleased(address indexed beneficiary, uint256 amount);
     event TokensRefunded(uint256 amount);
     event VestingRevoked(address indexed beneficiary);
+    event TokenReclaimed(address indexed token, address indexed to, uint256 value);
+    event BNBReclaimed(address indexed to, uint256 value);
 
     // State variables
     mapping(address => VestingSchedule) private _vestingSchedules;
@@ -83,6 +86,7 @@ contract CryptoSnackVesting is Ownable, ReentrancyGuard {
         if (beneficiary == address(0)) revert InvalidBeneficiary();
         if (amount == 0) revert InvalidVestingParameters();
         if (startTime < block.timestamp) revert InvalidVestingParameters();
+        if (startTime > block.timestamp + MAX_START_OFFSET_TIME) revert InvalidVestingParameters();
         if (cliffDuration == 0) revert InvalidVestingParameters();
         if (vestingDuration == 0) revert InvalidVestingParameters();
         if (cliffDuration > vestingDuration) revert InvalidVestingParameters();
@@ -181,25 +185,19 @@ contract CryptoSnackVesting is Ownable, ReentrancyGuard {
         return _getReleasableAmount(beneficiary);
     }
 
-    /**
-     * @dev Returns the current time.
-     * @return the current timestamp in seconds.
-     */
-    function getCurrentTime() internal view virtual returns (uint256) {
-        return block.timestamp;
-    }
-
     // Utilities
     function reclaimToken(IERC20 token) external onlyOwner {
         if (token == _token) revert TransferFailed();
 
         uint256 balance = token.balanceOf(address(this));
         token.safeTransfer(owner(), balance);
+        emit TokenReclaimed(address(token), owner(), balance);
     }
 
     function reclaimBNB() external onlyOwner {
         (bool success,) = owner().call{value: address(this).balance}("");
         if (!success) revert TransferFailed();
+        emit BNBReclaimed(owner(), address(this).balance);
     }
 
     /**
