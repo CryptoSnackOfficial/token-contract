@@ -41,6 +41,17 @@ A comprehensive token and vesting solution built on BNB Smart Chain (BSC) with a
   - Owner-only administrative functions
   - Built-in schedule validation
 
+#### Important: token amounts use base units (decimals)
+
+All token amounts passed into / returned from the vesting contract are denominated in the token's smallest unit ("base units"), **not** in human-readable token units.
+
+- For an 18-decimal ERC-20 token, **1 token = 10^18 base units**.
+- `createVestingSchedule(..., amount, ...)` expects `amount` in base units.
+  - Example: to vest **500 tokens** (18 decimals), pass `500 * 10^18` i.e. `500000000000000000000`.
+- `getReleasableAmount(address)` and `getVestingSchedule(address)` return base units as well.
+
+If you pass `500` as the amount for an 18-decimal token, that represents `0.000000000000000500` tokens.
+
 ## Deployment
 
 Fill `.env` file
