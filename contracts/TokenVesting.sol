@@ -28,30 +28,31 @@ contract CryptoSnackVesting is Ownable, ReentrancyGuard {
     // Errors
     error InvalidBeneficiary();
     error NoVestingSchedule();
-    error VestingAlreadyExists();
     error InvalidVestingParameters();
     error InsufficientTokenBalance();
     error NotRevocable();
-    error AlreadyRevoked();
     error NothingToRelease();
     error TransferFailed();
+    error InvalidScheduleIndex();
+    error NoRevocableSchedules();
 
     // Events
     event VestingScheduleCreated(
         address indexed beneficiary,
+        uint256 indexed scheduleIndex,
         uint256 amount,
         uint256 startTime,
         uint256 cliff,
         uint256 duration
     );
     event TokensReleased(address indexed beneficiary, uint256 amount);
-    event TokensRefunded(uint256 amount);
-    event VestingRevoked(address indexed beneficiary);
+    event TokensRefunded(address indexed beneficiary, uint256 indexed scheduleIndex, uint256 amount);
+    event VestingRevoked(address indexed beneficiary, uint256 indexed scheduleIndex);
     event TokenReclaimed(address indexed token, address indexed to, uint256 value);
     event BNBReclaimed(address indexed to, uint256 value);
 
     // State variables
-    mapping(address => VestingSchedule) private _vestingSchedules;
+    mapping(address => VestingSchedule[]) private _vestingSchedules;
     uint256 private _totalAllocated;
 
     // Token parameters
@@ -66,8 +67,12 @@ contract CryptoSnackVesting is Ownable, ReentrancyGuard {
         return _token;
     }
 
-    function getVestingSchedule(address beneficiary) external view returns (VestingSchedule memory) {
+    function getVestingSchedules(address beneficiary) external view returns (VestingSchedule[] memory) {
         return _vestingSchedules[beneficiary];
+    }
+
+    function getVestingScheduleCount(address beneficiary) external view returns (uint256) {
+        return _vestingSchedules[beneficiary].length;
     }
 
     function getTotalAllocated() external view returns (uint256) {
@@ -91,12 +96,11 @@ contract CryptoSnackVesting is Ownable, ReentrancyGuard {
         if (vestingDuration == 0) revert InvalidVestingParameters();
         if (cliffDuration > vestingDuration) revert InvalidVestingParameters();
         if (vestingDuration > MAX_VESTING_TIME) revert InvalidVestingParameters();
-        if (_vestingSchedules[beneficiary].totalAmount != 0) revert VestingAlreadyExists();
         if (_token.balanceOf(address(this)) < amount + _totalAllocated) revert InsufficientTokenBalance();
 
         uint256 cliff = startTime + cliffDuration;
 
-        _vestingSchedules[beneficiary] = VestingSchedule({
+        _vestingSchedules[beneficiary].push(VestingSchedule({
             totalAmount: amount,
             startTime: startTime,
             cliff: cliff,
@@ -104,12 +108,14 @@ contract CryptoSnackVesting is Ownable, ReentrancyGuard {
             releasedAmount: 0,
             revocable: revocable,
             revoked: false
-        });
+        }));
 
         _totalAllocated += amount;
 
+        uint256 idx = _vestingSchedules[beneficiary].length - 1;
         emit VestingScheduleCreated(
             beneficiary,
+            idx,
             amount,
             startTime,
             cliff,
@@ -117,57 +123,99 @@ contract CryptoSnackVesting is Ownable, ReentrancyGuard {
         );
     }
 
+    /// @notice Releases all currently releasable tokens across all schedules for msg.sender in a single transfer.
     function release() external nonReentrant {
         address beneficiary = msg.sender;
-        VestingSchedule storage schedule = _vestingSchedules[beneficiary];
+        VestingSchedule[] storage schedules = _vestingSchedules[beneficiary];
 
-        if (schedule.totalAmount == 0) revert NoVestingSchedule();
-        if (schedule.revoked) revert AlreadyRevoked();
+        if (schedules.length == 0) revert NoVestingSchedule();
 
-        uint256 releasable = _getReleasableAmount(beneficiary);
-        if (releasable == 0) revert NothingToRelease();
+        uint256 totalReleasable = 0;
+        uint256 i = 0;
+        while (i < schedules.length) {
+            VestingSchedule storage schedule = schedules[i];
+            uint256 releasable = _getReleasableAmountForSchedule(schedule);
+            if (releasable > 0) {
+                schedule.releasedAmount += releasable;
+                totalReleasable += releasable;
+            }
+            if (schedule.releasedAmount == schedule.totalAmount) {
+                schedules[i] = schedules[schedules.length - 1];
+                schedules.pop();
+                // do not increment i; check the swapped-in element next
+            } else {
+                i++;
+            }
+        }
 
-        schedule.releasedAmount += releasable;
-        _totalAllocated -= releasable;
-        _token.safeTransfer(beneficiary, releasable);
-        emit TokensReleased(beneficiary, releasable);
+        if (totalReleasable == 0) revert NothingToRelease();
+
+        _totalAllocated -= totalReleasable;
+        _token.safeTransfer(beneficiary, totalReleasable);
+        emit TokensReleased(beneficiary, totalReleasable);
     }
 
-    /// @notice Would automatically transfer releasable tokens to the beneficiary and then transfer the remaining tokens to the owner
-    function revoke(address beneficiary) external onlyOwner nonReentrant {
-        VestingSchedule storage schedule = _vestingSchedules[beneficiary];
+    /// @notice Revokes a specific schedule by index. Pays releasable to beneficiary and refunds remainder to owner.
+    function revokeSchedule(address beneficiary, uint256 scheduleIndex) external onlyOwner nonReentrant {
+        VestingSchedule[] storage schedules = _vestingSchedules[beneficiary];
 
-        if (schedule.totalAmount == 0) revert NoVestingSchedule();
+        if (scheduleIndex >= schedules.length) revert InvalidScheduleIndex();
+
+        VestingSchedule storage schedule = schedules[scheduleIndex];
         if (!schedule.revocable) revert NotRevocable();
-        if (schedule.revoked) revert AlreadyRevoked();
 
-        uint256 releasable = _getReleasableAmount(beneficiary);
+        _revokeOne(beneficiary, scheduleIndex);
+    }
+
+    /// @notice Revokes all revocable schedules for a beneficiary, skipping non-revocable ones.
+    function revokeAll(address beneficiary) external onlyOwner nonReentrant {
+        VestingSchedule[] storage schedules = _vestingSchedules[beneficiary];
+
+        if (schedules.length == 0) revert NoVestingSchedule();
+
+        bool anyRevoked = false;
+        uint256 i = 0;
+        while (i < schedules.length) {
+            if (!schedules[i].revocable) {
+                i++;
+                continue;
+            }
+            _revokeOne(beneficiary, i);
+            anyRevoked = true;
+            // _revokeOne removes element i via swap-and-pop; do not increment i
+        }
+
+        if (!anyRevoked) revert NoRevocableSchedules();
+    }
+
+    /// @dev Settles and removes the schedule at `index` (swap-and-pop). Assumes index is valid and schedule is revocable.
+    function _revokeOne(address beneficiary, uint256 index) private {
+        VestingSchedule[] storage schedules = _vestingSchedules[beneficiary];
+        VestingSchedule storage schedule = schedules[index];
+
+        uint256 releasable = _getReleasableAmountForSchedule(schedule);
         if (releasable > 0) {
-            schedule.releasedAmount += releasable;
             _totalAllocated -= releasable;
             _token.safeTransfer(beneficiary, releasable);
             emit TokensReleased(beneficiary, releasable);
         }
 
-        uint256 remaining = schedule.totalAmount - schedule.releasedAmount;
+        uint256 remaining = schedule.totalAmount - schedule.releasedAmount - releasable;
         if (remaining > 0) {
             _totalAllocated -= remaining;
             _token.safeTransfer(owner(), remaining);
-            emit TokensRefunded(remaining);
+            emit TokensRefunded(beneficiary, index, remaining);
         }
 
-        schedule.revoked = true;
-        emit VestingRevoked(beneficiary);
+        emit VestingRevoked(beneficiary, index);
+
+        // Swap-and-pop removal
+        schedules[index] = schedules[schedules.length - 1];
+        schedules.pop();
     }
 
-    function _getReleasableAmount(address beneficiary) private view returns (uint256) {
-        VestingSchedule memory schedule = _vestingSchedules[beneficiary];
-
+    function _getReleasableAmountForSchedule(VestingSchedule memory schedule) private view returns (uint256) {
         if (block.timestamp < schedule.cliff) {
-            return 0;
-        }
-
-        if (schedule.revoked) {
             return 0;
         }
 
@@ -181,8 +229,21 @@ contract CryptoSnackVesting is Ownable, ReentrancyGuard {
         return vestedAmount - schedule.releasedAmount;
     }
 
+    /// @notice Returns the aggregate releasable amount across all schedules for a beneficiary.
     function getReleasableAmount(address beneficiary) external view returns (uint256) {
-        return _getReleasableAmount(beneficiary);
+        VestingSchedule[] storage schedules = _vestingSchedules[beneficiary];
+        uint256 total = 0;
+        for (uint256 i = 0; i < schedules.length; i++) {
+            total += _getReleasableAmountForSchedule(schedules[i]);
+        }
+        return total;
+    }
+
+    /// @notice Returns the releasable amount for a specific schedule.
+    function getReleasableAmount(address beneficiary, uint256 scheduleIndex) external view returns (uint256) {
+        VestingSchedule[] storage schedules = _vestingSchedules[beneficiary];
+        if (scheduleIndex >= schedules.length) revert InvalidScheduleIndex();
+        return _getReleasableAmountForSchedule(schedules[scheduleIndex]);
     }
 
     // Utilities
