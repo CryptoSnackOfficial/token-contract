@@ -30,11 +30,24 @@ A comprehensive token and vesting solution built on BNB Smart Chain (BSC) with a
 
 ### Vesting Contract (`CryptoSnackVesting`)
 
+- **Multiple Schedules per Beneficiary**
+  - Each wallet can hold any number of independent vesting schedules simultaneously
+  - Each schedule has its own token amount, start time, cliff, duration, and revocability
+  - Fully-released schedules are automatically removed from storage (no manual cleanup required)
+
 - **Vesting Schedules**
-  - Customizable cliff and vesting duration
-  - Revocable/non-revocable schedules
-  - Token release tracking
-  - Multiple beneficiary support
+  - Customizable cliff and vesting duration (both expressed as second intervals from `startTime`)
+  - Revocable/non-revocable schedules per grant
+  - Token release tracking per schedule
+  - Linear vesting from `startTime` once `cliff` is passed
+
+- **Release**
+  - `release()` aggregates all currently releasable tokens across every active schedule and performs a single token transfer — no need to call per schedule
+
+- **Revocation**
+  - `revokeSchedule(beneficiary, index)` targets a single schedule by its current array index
+  - `revokeAll(beneficiary)` revokes every revocable schedule in one call, skipping non-revocable ones
+  - On revoke: earned-but-unreleased tokens go to the beneficiary; unvested remainder is refunded to the owner
 
 - **Security**
   - Protected against reentrancy
@@ -48,7 +61,7 @@ All token amounts passed into / returned from the vesting contract are denominat
 - For an 18-decimal ERC-20 token, **1 token = 10^18 base units**.
 - `createVestingSchedule(..., amount, ...)` expects `amount` in base units.
   - Example: to vest **500 tokens** (18 decimals), pass `500 * 10^18` i.e. `500000000000000000000`.
-- `getReleasableAmount(address)` and `getVestingSchedule(address)` return base units as well.
+- `getReleasableAmount(address)` and `getVestingSchedules(address)` return base units as well.
 
 If you pass `500` as the amount for an 18-decimal token, that represents `0.000000000000000500` tokens.
 
@@ -149,16 +162,73 @@ setDex("0xC6665d98Efd81f47B03801187eB46cbC63F328B0", true)
 
 ### Vesting Contract Functions
 
+#### `createVestingSchedule` — parameter guide
+
+```
+createVestingSchedule(
+    address beneficiary,    // wallet that will receive the tokens
+    uint256 amount,         // token amount in base units (see note above)
+    uint256 startTime,      // Unix timestamp (seconds) when linear vesting begins
+    uint256 cliffDuration,  // seconds after startTime before ANY tokens can be claimed
+    uint256 vestingDuration,// total vesting length in seconds (measured from startTime)
+    bool    revocable       // true = owner can revoke this schedule later
+)
+```
+
+**Key points:**
+- `startTime` must be a Unix timestamp **in the future** (≥ `block.timestamp`) and no more than 365 days from now.
+- `cliffDuration` and `vestingDuration` are **durations in seconds**, not timestamps. They are added to `startTime` internally:
+  - cliff expires at `startTime + cliffDuration`
+  - vesting ends at `startTime + vestingDuration`
+- `cliffDuration` must be ≤ `vestingDuration` (cliff cannot outlast the vesting period).
+- `vestingDuration` cannot exceed 10 years.
+- A wallet can have **multiple independent schedules** — calling `createVestingSchedule` for the same beneficiary again simply appends a new schedule.
+- The contract must already hold enough tokens: `contractBalance ≥ amount + totalAllocated`.
+
+**Example — 12-month cliff, 36-month total vest, starting in 1 hour:**
+
+```solidity
+uint256 start        = block.timestamp + 1 hours;
+uint256 cliffSecs    = 365 days;         // 1 year cliff
+uint256 durationSecs = 3 * 365 days;     // 3 year total vest
+uint256 amount       = 500_000 * 1e18;   // 500,000 tokens (18 decimals)
+
+createVestingSchedule(
+    0xBeneficiary,
+    amount,
+    start,
+    cliffSecs,
+    durationSecs,
+    true   // revocable
+);
+```
+
+After the cliff passes, the beneficiary accrues tokens linearly. At `startTime + 365 days` they can claim ~33 % of the grant; at `startTime + 3*365 days` they can claim 100 %.
+
 #### Schedule Management
-- `createVestingSchedule(address, uint256, uint256, uint256, uint256, bool)`: Create new vesting schedule
-- `release()`: Release available tokens to beneficiary
-- `revoke(address)`: Revoke vesting schedule (if revocable)
+
+- `createVestingSchedule(address beneficiary, uint256 amount, uint256 startTime, uint256 cliffDuration, uint256 vestingDuration, bool revocable)`: Create a new vesting schedule and append it to the beneficiary's list. Emits `VestingScheduleCreated(beneficiary, scheduleIndex, amount, startTime, cliff, duration)`.
+- `release()`: Claim all currently releasable tokens across **every** active schedule for `msg.sender` in a single transfer. Fully-vested schedules are automatically deleted. Reverts with `NothingToRelease` if nothing is available yet.
+- `revokeSchedule(address beneficiary, uint256 scheduleIndex)`: Revoke a specific schedule by its current index (owner only). Transfers earned-but-unreleased tokens to the beneficiary and refunds the unvested remainder to the owner. The schedule is then deleted.
+- `revokeAll(address beneficiary)`: Revoke every **revocable** schedule for the beneficiary in one call (owner only). Non-revocable schedules are silently skipped. Reverts with `NoRevocableSchedules` if none qualify.
+
+> **Index stability note:** indices can change after any deletion (swap-and-pop). Always call `getVestingSchedules(beneficiary)` first to read the current index of the schedule you want to revoke.
 
 #### View Functions
-- `getVestingSchedule(address)`: Get vesting schedule details
-- `getReleasableAmount(address)`: Get releasable token amount
-- `getTotalAllocated()`: Get total allocated tokens
-- `getToken()`: Get vesting token address
+
+- `getVestingSchedules(address beneficiary)`: Returns the full array of `VestingSchedule` structs currently active for the beneficiary. Each struct contains:
+  - `totalAmount` — total tokens allocated (base units)
+  - `startTime` — Unix timestamp when linear vesting starts
+  - `cliff` — Unix timestamp before which nothing can be claimed (`startTime + cliffDuration`)
+  - `duration` — total vesting length in seconds
+  - `releasedAmount` — tokens already transferred to the beneficiary
+  - `revocable` — whether the owner can revoke this schedule
+  - `revoked` — always `false` for active schedules (revoked schedules are deleted, not kept)
+- `getVestingScheduleCount(address beneficiary)`: Returns the number of active schedules for the beneficiary.
+- `getReleasableAmount(address beneficiary)`: Returns the **aggregate** token amount the beneficiary can claim right now across all their schedules (base units).
+- `getReleasableAmount(address beneficiary, uint256 scheduleIndex)`: Returns the releasable amount for a specific schedule by index.
+- `getTotalAllocated()`: Returns total tokens currently locked across all beneficiaries (base units).
+- `getToken()`: Returns the ERC-20 token address used by this vesting contract.
 
 ## Constants
 
@@ -168,8 +238,8 @@ setDex("0xC6665d98Efd81f47B03801187eB46cbC63F328B0", true)
 - `MAX_BATCH_SIZE`: 200 (maximum addresses for batch transfer)
 
 ### Vesting Contract
-- `MAX_START_OFFSET_TIME`: 365 days (maximum delay for schedule start)
-- `MAX_VESTING_TIME`: 10 years (maximum vesting duration)
+- `MAX_START_OFFSET_TIME`: 365 days (maximum allowed delay between now and `startTime`)
+- `MAX_VESTING_TIME`: 10 years (maximum value for `vestingDuration`)
 
 ## Run Tests
 
@@ -182,7 +252,8 @@ npx hardhat test
 1. Owner privileges should be managed through a secure multi-sig wallet
 2. Tax wallet should be a secure address
 3. Blacklist and whitelist functions should be used with caution
-4. Vesting schedules cannot be modified once created
+4. Vesting schedules cannot be modified once created — only revoked (if marked `revocable`) or claimed via `release()`
+5. Schedule indices are **not stable**: deleting a schedule via `release()` (auto-cleanup when fully vested) or `revokeSchedule()` / `revokeAll()` may change the indices of remaining schedules. Always query `getVestingSchedules(beneficiary)` immediately before calling `revokeSchedule` to obtain the current index.
 
 ## License
 
